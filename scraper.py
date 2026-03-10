@@ -10,32 +10,38 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import json
+import time
+from typing import Iterable
 
 with open("config.json") as config:
-    years = json.load(config)["years"]
+    data = json.load(config)
+    start_year = data["start_year"]
+    end_year = data["end_year"]
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
-def setup_session():
+def setup_session() -> requests.Session:
     """Create a requests session with retries and connection pooling."""
     session = requests.Session()
-    retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-    session.mount('https://', HTTPAdapter(max_retries=retries))
+    retries = Retry(total=3, backoff_factor=1, status_forcelist=[408, 429, 500, 502, 503, 504]) # backoff_factor: How long to wait between retries
+    session.mount('https://', HTTPAdapter(max_retries=retries)) # Mount the adapter (retries) to the session.
     session.headers.update({
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
     })
     return session
 
-def get_conference_urls(start_year, end_year):
+# Return a list of tuples, each containing a URL, year, and month.
+def get_conference_urls(start_year, end_year) -> list[tuple[str, str, str]]:
     """Generate URLs for all General Conferences from start_year to end_year."""
     base_url = 'https://www.churchofjesuschrist.org/study/general-conference/{year}/{month}?lang=eng'
     return [(base_url.format(year=year, month=month), str(year), month)
             for year in range(start_year, end_year + 1)
             for month in ['04', '10']]
 
-def get_talk_urls(conference_url, year, month, session):
+# Returns a list of tuples, each containing a URL and a talk number -> [(URL, talk_number)]
+def get_talk_urls(conference_url, year, month, session) -> list[tuple[str, str]]:
     """Fetch talk URLs from a conference page, excluding session videos."""
     try:
         response = session.get(conference_url, timeout=10)
@@ -54,8 +60,8 @@ def get_talk_urls(conference_url, year, month, session):
         'general-womens-session', 'priesthood-session', 'women-session', 'womens-session',
         'general-conference', 'session', 'video', 'all-sessions', 'full-session'
     ]
-
-    for link in soup.select('div.talk-list a[href*="/study/general-conference/"], article a[href*="/study/general-conference/"]'):
+    links = soup.select('div.talk-list a[href*="/study/general-conference/"], article a[href*="/study/general-conference/"]')
+    for link in links:
         href = link.get('href')
         if not href or 'lang=eng' not in href:
             continue
@@ -65,13 +71,16 @@ def get_talk_urls(conference_url, year, month, session):
             continue
         seen_urls.add(canonical_url)
 
+        # Check if the URL is a session video.
         match = re.search(r'/(\d{4})/(\d{2})/(.+)', canonical_url)
         if not match:
             continue
+
         url_year, url_month, slug = match.groups()
         if any(session_slug in slug.lower() for session_slug in session_slugs):
             continue
 
+        # Open the talk URL and make sure it is a talk page.
         try:
             talk_response = session.get(canonical_url, timeout=5)
             talk_response.raise_for_status()
@@ -88,7 +97,8 @@ def get_talk_urls(conference_url, year, month, session):
     logging.info(f"Found {len(talk_urls)} talk URLs for {year}-{month}")
     return talk_urls
 
-def scrape_talk(args):
+# Returns a tuple containing a dictionary of talk metadata and a talk number -> (talk_metadata, talk_number)
+def scrape_talk(args) -> tuple[dict[str, str], str]:
     """Scrape metadata and transcript for a single talk."""
     talk_url, year, talk_number, session = args
     start_time = time.time()
@@ -140,7 +150,7 @@ def scrape_talk(args):
         "text": content,
     }, talk_number
 
-def split_talks(talk):
+def split_talks(talk) -> list[dict[str, str]]:
     """Split the talk content into paragraphs."""
     paragraph_data = []
     paragraphs = talk["text"].split('\n\n')
@@ -157,21 +167,41 @@ def split_talks(talk):
         })
     return paragraph_data
 
+def get_talk_urls_for_conference(args) -> list[tuple[str, str, str, requests.Session]]:
+    """Wrapper for parallel URL discovery. args = (conf_url, year, month, session)."""
+    conf_url, year, month, session = args
+    print(f"Getting talk URLs for {year}-{month}")
+    talk_urls = get_talk_urls(conf_url, year, month, session)
+    # shape matches what scrape_talk expects: (url, year, talk_number, session)
+    return [(url, year, talk_number, session) for url, talk_number in talk_urls]
+
 if __name__ == "__main__":
     print("Start Time:", datetime.now().strftime("%H:%M:%S"))
 
-    talks_data = []
+    talks_data = [] 
     paragraphs_data = []
     session = setup_session()
 
     # Step 1: Get conference URLs
-    conference_urls = get_conference_urls(2025 - years, 2025)
+    conference_urls = get_conference_urls(start_year, end_year)
 
     # Step 2: Get all talk URLs sequentially (or parallelize if needed)
+    start = time.time()
+    
     all_talk_urls = []
-    for conf_url, year, month in conference_urls:
-        talk_urls = get_talk_urls(conf_url, year, month, session)
-        all_talk_urls.extend([(url, year, talk_number, session) for url, talk_number in talk_urls])
+    conference_args = [(conf_url, year, month, session) for conf_url, year, month in conference_urls]
+    
+    # 4 threads: 360 seconds
+    # 5 threads: 152 seconds
+    # 7 threads: 149 seconds
+    # 10 threads: 186 seconds
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        for result in executor.map(get_talk_urls_for_conference, conference_args):
+            # result is a list[(url, year, talk_number, session)]
+            all_talk_urls.extend(result)
+
+    end = time.time()
+    print(f"Time taken to get talk URLs: {end - start} seconds")
 
     # Step 3: Scrape talks concurrently
     with ThreadPoolExecutor(max_workers=10) as executor:
