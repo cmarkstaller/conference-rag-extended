@@ -235,7 +235,7 @@ def answer_question(
 
 def main() -> None:
     load_dotenv()
-    st.set_page_config(page_title="General Conference RAG", page_icon="📖", layout="wide")
+    st.set_page_config(page_title="General Conference RAG", page_icon="assets/talkfinderlogo.png", layout="wide")
     st.title("General Conference RAG")
     st.caption("Pinecone (child vectors) → parent text (JSON) → Cohere rerank → OpenAI answer")
 
