@@ -1,3 +1,4 @@
 SCRAPED_TALKS.csv
 SCRAPED_PARAGRAPHS.csv
 config.json
+.env
